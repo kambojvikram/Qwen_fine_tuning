@@ -1,0 +1,23 @@
+--tensor-model-parallel-size 2
+--pipeline-model-parallel-size 1
+--num-layers 32
+--hidden-size 4096
+--num-attention-heads 32
+--seq-length 2048
+--micro-batch-size 1
+--train-steps 20000
+--lr 5e-6
+--min-lr 5e-7
+--lr-decay-style cosine
+--lr-warmup-steps 500
+--clip-grad 1.0
+--bf16
+--attention-dropout 0.0
+--hidden-dropout 0.0
+--tokenizer-name Qwen/Qwen2.5-7B-Instruct
+--vocab-size 152064          # match tokenizer (or let model infer if you wrap it)
+--seed 1234
+--log-every 10
+--train-data /path/train.jsonl
+--max-prompt-len 512
+--max-resp-len 512
