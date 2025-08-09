@@ -1,3 +1,75 @@
+What you’re doing here is **setting up a QLoRA fine-tuning run** for your **Qwen3-32B** model using the **KTO (Kahneman-Tversky Optimization) trainer** from the TRL library, so the model learns to strictly follow your domain-specific instructions.
+
+Breaking it down step-by-step:
+
+---
+
+### **1. Objective**
+
+* You have a CSV with:
+
+  * **prompt** → system instructions (domain rules)
+  * **question** → user query
+  * **response** → ideal assistant answer
+* You want the model to **prefer your gold responses** and avoid drifting back to its original style, without needing rejected answers (like in DPO).
+
+---
+
+### **2. Why KTO**
+
+* **SFT**: just predicts your gold response → might not be strict enough.
+* **DPO**: needs paired chosen/rejected → you don’t have that.
+* **KTO**: works with just positives, but still optimizes a **preference-style loss** by internally generating negatives to push away from.
+
+---
+
+### **3. What the script does**
+
+* **Loads tokenizer & model** (`Qwen3-32B-Instruct`) in **4-bit QLoRA** to fit big model in limited GPU memory.
+* **Sets LoRA adapters** on the attention layers (`q_proj, k_proj, v_proj, o_proj`).
+* **Processes your CSV**:
+
+  * Joins prompt + question into one input.
+  * Tokenizes with max **8192 tokens** for the prompt, **64 tokens** for the target.
+  * Masks the prompt part in labels (`-100`) so loss is only on the answer.
+* **Uses TRL’s `KTOTrainer`**:
+
+  * Gains = your gold responses.
+  * Losses = model’s own generated responses for same prompts (implicit negatives).
+  * Applies **gain\_weight** and **loss\_weight** so you can push harder toward your style.
+* **Trains with gradient accumulation** to deal with huge context length.
+* **Saves adapters** so you can merge or swap into base model later.
+
+---
+
+### **4. Why the small tweaks I added matter**
+
+* `remove_unused_columns=False` → prevents HF Trainer from dropping your `labels` column.
+* `ddp_find_unused_parameters=False` → avoids DDP hangs with LoRA.
+* `optim="paged_adamw_8bit"` → better for QLoRA memory/throughput.
+* `trust_remote_code=True` for tokenizer → required for Qwen formatting.
+* `gradient_checkpointing_kwargs={"use_reentrant": False}` → avoids bugs in newer torch.
+
+---
+
+### **5. Expected outcome**
+
+After training:
+
+* Model should **follow your system prompt exactly**.
+* More reliable domain compliance than SFT.
+* Uses similar training time to SFT (unlike DPO, which is \~2× slower).
+
+---
+
+If you want, I can **add a `label` column** to your dataset automatically so that later, if you create any “bad” responses, KTO can train on mixed desirable/undesirable examples.
+That would make it even stronger.
+
+Do you want me to adjust the script for that?
+
+
+
+
 # train_qwen3_32b_kto_qlora.py
 import os, torch
 from datasets import load_dataset
