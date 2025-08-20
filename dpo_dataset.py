@@ -1,55 +1,15 @@
-from torch.utils.data import Dataset
-import json
+scale = 1.4  # try 1.1–1.6; validate before committing
 
-class PairwisePreferenceDataset(Dataset):
-    # JSONL with keys: prompt, chosen, rejected
-    def __init__(self, path, tokenizer, max_prompt=512, max_target=512):
-        self.tok = tokenizer
-        self.rows = [json.loads(l) for l in open(path)]
-        self.max_prompt = max_prompt
-        self.max_target = max_target
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
 
-    def _encode(self, prompt, response):
-        # teacher-forcing format: [prompt] -> [response]
-        prompt_ids  = self.tok(prompt, truncation=True, max_length=self.max_prompt, add_special_tokens=False)
-        resp_ids    = self.tok(response, truncation=True, max_length=self.max_target, add_special_tokens=False)
-        # input_ids = [ ...prompt..., ...response... ]
-        input_ids = prompt_ids["input_ids"] + resp_ids["input_ids"] + [self.tok.eos_token_id]
-        # labels: ignore prompt tokens; train only on response tokens
-        labels = [-100]*len(prompt_ids["input_ids"]) + resp_ids["input_ids"] + [self.tok.eos_token_id]
-        return input_ids, labels
+model = AutoModelForCausalLM.from_pretrained(base_id, torch_dtype="auto", device_map="auto")
+model = PeftModel.from_pretrained(model, lora_path)
 
-    def __getitem__(self, i):
-        r = self.rows[i]
-        pc_ids, pc_lbl = self._encode(r["prompt"], r["chosen"])
-        pr_ids, pr_lbl = self._encode(r["prompt"], r["rejected"])
-        return {
-            "chosen_input_ids": pc_ids,
-            "chosen_labels": pc_lbl,
-            "rejected_input_ids": pr_ids,
-            "rejected_labels": pr_lbl,
-        }
+model.set_adapter("default")
+# Temporarily exaggerate ΔW at runtime…
+model.base_model.model.set_adapter_scaling({"default": scale})
 
-    def __len__(self):
-        return len(self.rows)
-
-def megatron_collate(batch, pad_id):
-    # Pad to max length per side
-    import torch
-    def pad_side(key):
-        mx = max(len(x[key]) for x in batch)
-        out = []
-        for x in batch:
-            seq = x[key]
-            if "labels" in key:
-                pad_val = -100
-            else:
-                pad_val = pad_id
-            out.append(seq + [pad_val]*(mx-len(seq)))
-        return torch.tensor(out, dtype=torch.long)
-    return {
-        "chosen_input_ids":   pad_side("chosen_input_ids"),
-        "chosen_labels":      pad_side("chosen_labels"),
-        "rejected_input_ids": pad_side("rejected_input_ids"),
-        "rejected_labels":    pad_side("rejected_labels"),
-    }
+# …then bake that scaled ΔW in ONCE.
+merged = model.merge_and_unload()
+merged.save_pretrained(f"model-merged-{scale:.1f}x")
