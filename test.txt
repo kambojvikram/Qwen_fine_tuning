@@ -1,0 +1,44 @@
+You are absolutely right to ask this. While Qwen (v2/2.5) follows a "LLaMA-like" architecture (RoPE, SwiGLU, RMSNorm), it has **three distinct structural features** that make it fundamentally more hostile to quantization than LLaMA 3 or Mistral.
+
+If you blindly apply standard GASQ (or GPTQ/AWQ) settings, you will likely degrade the model's reasoning capabilities. Here is exactly what you need to watch out for:
+
+### 1. The "Vocabulary Wall" (152k Tokens vs. 32k/128k)
+
+The single biggest differentiator of Qwen is its massive vocabulary size (~152,000 tokens), compared to LLaMA-2 (32k) or Mistral (32k).
+
+* **The GASQ Conflict:** GASQ's default "Safety Floor" keeps Embedding layers at **8-bit** or **FP16**. For LLaMA, this is cheap (~130MB). For Qwen, the embedding matrix is enormous (). Keeping this in FP16 consumes nearly **1.2 GB of VRAM** just for the embeddings.
+* **The Risk:** If you try to compress this massive matrix to 3-bit to save space, you risk "Vocabulary Collapse." Qwen uses this large vocab to handle multi-lingual data and raw byte-fallback. Quantizing the "tail" of this distribution (rare Chinese/Code tokens) will cause the model to output gibberish for non-English inputs.
+* **Fix:** You **cannot** afford a full FP16 safety floor. You must use a **mixed-precision embedding strategy** (e.g., keep the top 20k frequent tokens at 8-bit, compress the tail to 4-bit) or accept the higher VRAM cost.
+
+### 2. Bias Terms in QKV Layers (The Extrapolation Anchor)
+
+Unlike LLaMA (which eliminated all bias terms), Qwen explicitly **retains bias terms** in the Query-Key-Value (QKV) projections to improve length extrapolation.
+
+* **The GASQ Conflict:** Many quantization kernels (especially highly optimized 3-bit packers) assume a "bias-free" architecture (Weight-Only). If your GASQ implementation or underlying kernel ignores the bias vector during the `Linear` layer packing, you will introduce a systematic shift in the attention scores.
+* **The Risk:** Losing the bias term in QKV doesn't just add noise; it breaks the model's ability to handle context lengths longer than the training window (ALiBi/RoPE extrapolation relies on these biases as positional anchors).
+* **Fix:** Ensure your quantization kernel supports `bias=True`. If using a custom packer, you must explicitly serialize the bias vector alongside the quantized weights.
+
+### 3. SwiGLU "Quadratic" Activation Spikes
+
+Qwen uses **SwiGLU** (Swish-Gated Linear Unit), which involves element-wise multiplication of two linear projections.
+
+* **The GASQ Conflict:** SwiGLU scales *quadratically* rather than linearly. This creates "Activation Outliers" that are significantly sharper (larger magnitude) than in GeLU models.
+* **The Risk:** GASQ's "Saliency" metric () measures RMS magnitude. In SwiGLU models, a few channels will have massive magnitudes (outliers) while the rest are near zero. A standard "Min-Max" clipper or even "MSE" clipper might be thrown off by these extreme outliers, dedicating the entire quantization grid to preserving one outlier while crushing the signal of the other 99% of weights to zero.
+* **Fix:** You likely need a **clipping threshold** () that is more aggressive. You must truncate the "SwiGLU outliers" to preserve the resolution of the main body of weights.
+
+### 4. Tied Embeddings (Specific to Smaller Qwen Variants)
+
+If you are fine-tuning smaller Qwen versions (e.g., 0.5B, 1.5B, or some 7B variants), be aware that they often **tie** the input embedding matrix to the output LM Head.
+
+* **The GASQ Conflict:** GASQ might try to assign different bit-widths to the "Input Embedding" (Safety Floor = 8-bit) and the "Output Head" (Saliency-based).
+* **The Risk:** If these modules share the same memory pointer in PyTorch (`model.embed_tokens.weight` is the same object as `model.lm_head.weight`), quantizing one will inherently quantize the other. If you calculate gradients for them separately, you might get conflicting importance scores.
+* **Fix:** Check `model.config.tie_word_embeddings`. If `True`, force the stricter of the two constraints (usually the 8-bit Safety Floor) on the shared weight.
+
+### Summary of Adjustments for Qwen
+
+| Feature | Qwen Characteristic | GASQ Risk | Required Adjustment |
+| --- | --- | --- | --- |
+| **Vocabulary** | **Huge (152k)** | Massive VRAM usage for FP16 safety floor. | Accept VRAM cost or use mixed-precision embeddings. |
+| **QKV Layers** | **Has Bias Terms** | Quantizer might ignore/drop bias. | Ensure kernel supports `bias=True`. |
+| **Activation** | **SwiGLU** | Extreme outliers dominate grid. | Use aggressive clipping (). |
+| **Embeddings** | **Often Tied** | Conflicting bit-allocations. | Force `tie_word_embeddings` check. |
